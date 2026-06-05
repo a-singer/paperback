@@ -1,0 +1,53 @@
+name: Build iOS
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+        targets: aarch64-apple-ios
+
+    - name: Build Rust XCFramework
+      run: cargo run -p xtask -- ios --release
+
+    - name: Set up Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: latest-stable
+
+    - name: Build iOS App (Archive)
+      run: |
+        xcodebuild -project ios/Paperback.xcodeproj \
+                   -scheme Paperback \
+                   -configuration Release \
+                   -sdk iphoneos \
+                   -archivePath $PWD/Paperback.xcarchive \
+                   clean archive \
+                   CODE_SIGNING_ALLOWED=NO
+
+    - name: Package App (.ipa)
+      run: |
+        mkdir -p Payload
+        cp -r Paperback.xcarchive/Products/Applications/Paperback.app Payload/
+        zip -r Paperback.ipa Payload
+        
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: paperback-ios
+        path: Paperback.ipa
+        retention-days: 7
