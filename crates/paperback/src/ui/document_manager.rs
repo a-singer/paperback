@@ -14,11 +14,11 @@ use paperback_core::{
 	parser::PASSWORD_REQUIRED_ERROR_PREFIX,
 	session::DocumentSession,
 };
+use patois::t;
 use wxdragon::{
 	color::Colour,
 	event::{EventType, WindowEventData},
 	prelude::*,
-	translations::translate as t,
 };
 
 use super::{
@@ -37,7 +37,9 @@ pub struct DocumentTab {
 const POSITION_SAVE_INTERVAL_SECS: u64 = 3;
 const WXK_F10: i32 = 349;
 const WXK_WINDOWS_MENU: i32 = 395;
+#[cfg(target_os = "windows")]
 const WXK_UP: i32 = 315;
+#[cfg(target_os = "windows")]
 const WXK_DOWN: i32 = 317;
 
 pub struct DocumentManager {
@@ -77,14 +79,18 @@ impl DocumentManager {
 	}
 
 	pub fn open_file(&mut self, self_rc: &Rc<Mutex<Self>>, path: &Path) -> bool {
-		self.open_file_impl(self_rc, path, true)
+		self.open_file_impl(self_rc, path, true, false)
+	}
+
+	pub fn open_file_restore(&mut self, self_rc: &Rc<Mutex<Self>>, path: &Path) -> bool {
+		self.open_file_impl(self_rc, path, true, true)
 	}
 
 	pub fn open_help_file(&mut self, self_rc: &Rc<Mutex<Self>>, path: &Path) -> bool {
-		self.open_file_impl(self_rc, path, false)
+		self.open_file_impl(self_rc, path, false, false)
 	}
 
-	fn open_file_impl(&mut self, self_rc: &Rc<Mutex<Self>>, path: &Path, track: bool) -> bool {
+	fn open_file_impl(&mut self, self_rc: &Rc<Mutex<Self>>, path: &Path, track: bool, is_restore: bool) -> bool {
 		if !path.exists() {
 			let template = t("File not found: {}");
 			let message = template.replace("{}", &path.to_string_lossy());
@@ -95,11 +101,24 @@ impl DocumentManager {
 			self.notebook.set_selection(index);
 			return true;
 		}
+
+		let import_path = path.with_extension("paperback");
+		if !is_restore && import_path.exists() {
+			let message = t("A .paperback file was found for this document. Would you like to import it?");
+			let title = t("Import document data");
+			let dialog = MessageDialog::builder(&self.notebook, &message, &title)
+				.with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconQuestion | MessageDialogStyle::Centre)
+				.build();
+			if dialog.show_modal() == wxdragon::id::ID_YES {
+				let config = self.config.lock().unwrap();
+				config.import_settings_from_file(&path.to_string_lossy(), import_path.to_str().unwrap());
+			}
+		}
+
 		let (password, forced_extension) = {
 			let config = self.config.lock().unwrap();
 			let path_str = path.to_string_lossy();
 			config.refresh_document_hash(&path_str);
-			config.import_document_settings(&path_str);
 			let forced_extension = config.get_document_format(&path_str);
 			let password = config.get_document_password(&path_str);
 			drop(config);
@@ -575,6 +594,7 @@ impl DocumentManager {
 			}
 		});
 		let text_ctrl_for_menu = text_ctrl;
+		#[cfg(target_os = "windows")]
 		let dm_for_nav = Rc::clone(self_rc);
 		#[cfg(target_os = "linux")]
 		let key_map = navigation_key_map;
@@ -635,6 +655,7 @@ impl DocumentManager {
 /// Returns (new_position, preferred_column) for character-column-based vertical navigation.
 /// Uses wxdragon PositionToXY, XYToPosition, and GetLineLength so the cursor lands on the same
 /// character column (not pixel column) on the target visual line.
+#[cfg(target_os = "windows")]
 fn navigate_line_by_column(text_ctrl: TextCtrl, going_down: bool, pref_col: Option<i64>) -> Option<(i64, i64)> {
 	let current_pos = text_ctrl.get_insertion_point().max(0);
 	let (current_col, current_line) = text_ctrl.position_to_xy(current_pos)?;

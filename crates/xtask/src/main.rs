@@ -1,21 +1,26 @@
 use std::{
 	env,
 	error::Error,
-	fs::{self, File},
-	io::{self, Cursor, Read},
+	fs,
+	io::{Cursor, Read},
 	path::{Path, PathBuf},
 	process::Command,
 };
+#[cfg(not(target_os = "macos"))]
+use std::{fs::File, io};
 
 use flate2::read::GzDecoder;
 use tar::Archive;
 use walkdir::WalkDir;
+#[cfg(not(target_os = "macos"))]
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 const PDFIUM_ANDROID_ARM64_URL: &str =
 	"https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-android-arm64.tgz";
 const PDFIUM_ANDROID_ARM_URL: &str =
 	"https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-android-arm.tgz";
+const PDFIUM_IOS_ARM64_URL: &str =
+	"https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-ios-device-arm64.tgz";
 
 fn main() -> Result<(), Box<dyn Error>> {
 	let task = env::args().nth(1);
@@ -23,6 +28,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 		Some("release") => release()?,
 		Some("android") => android()?,
 		Some("ios") => ios()?,
+		Some("gen-pot") => gen_pot()?,
 		_ => print_help(),
 	}
 	Ok(())
@@ -31,6 +37,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn print_help() {
 	println!("Tasks:");
 	println!("	release	Build release binaries and package them");
+	println!("	gen-pot	Regenerate po/paperback.pot from all translatable crates");
 	println!("	android	Generate Kotlin bindings and build native Android libraries");
 	println!("		--release          Build APK using gradlew assembleRelease");
 	println!("		--debug            Build APK using gradlew assembleDebug");
@@ -42,26 +49,31 @@ fn print_help() {
 
 fn release() -> Result<(), Box<dyn Error>> {
 	let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-	let status = Command::new(cargo).current_dir(project_root()).args(&["build", "--release"]).status()?;
+	let status =
+		Command::new(cargo).current_dir(project_root()).args(&["build", "--release", "-p", "paperback"]).status()?;
 	if !status.success() {
 		return Err("Cargo build failed".into());
 	}
 	let target_dir = project_root().join("target/release");
-	let exe_name = if cfg!(windows) { "paperback.exe" } else { "paperback" };
-	let exe_path = target_dir.join(exe_name);
-	let readme_path = target_dir.join("readme.html");
-	let langs_path = target_dir.join("langs");
-	let sounds_path = target_dir.join("sounds");
-	let pdfium_dll_path = target_dir.join("pdfium.dll");
-	if !exe_path.exists() {
-		return Err("Executable not found".into());
+	#[cfg(target_os = "macos")]
+	return build_mac_dmg(&target_dir);
+	#[cfg(not(target_os = "macos"))]
+	{
+		let exe_name = if cfg!(windows) { "paperback.exe" } else { "paperback" };
+		let exe_path = target_dir.join(exe_name);
+		let readme_path = target_dir.join("readme.html");
+		let sounds_path = target_dir.join("sounds");
+		let pdfium_dll_path = target_dir.join("pdfium.dll");
+		if !exe_path.exists() {
+			return Err("Executable not found".into());
+		}
+		println!("Packaging binary, docs, and sounds...");
+		build_zip_package(&target_dir, &exe_path, &readme_path, &sounds_path, &pdfium_dll_path)?;
+		if cfg!(windows) {
+			build_windows_installer(&target_dir)?;
+		}
+		Ok(())
 	}
-	println!("Packaging binaries, docs, and translations...");
-	build_zip_package(&target_dir, &exe_path, &readme_path, &langs_path, &sounds_path, &pdfium_dll_path)?;
-	if cfg!(windows) {
-		build_windows_installer(&target_dir)?;
-	}
-	Ok(())
 }
 
 fn android() -> Result<(), Box<dyn Error>> {
@@ -184,12 +196,48 @@ fn download_pdfium_so(url: &str, dest: &Path) -> Result<(), Box<dyn Error>> {
 	Err(format!("libpdfium.so not found in archive from {url}").into())
 }
 
+fn download_pdfium_dylib(url: &str, dest: &Path) -> Result<(), Box<dyn Error>> {
+	let skip =
+		env::var("PAPERBACK_SKIP_PDFIUM_DOWNLOAD").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+	if dest.exists() && !skip {
+		return Ok(());
+	}
+	if skip {
+		return Ok(());
+	}
+	if let Some(parent) = dest.parent() {
+		fs::create_dir_all(parent)?;
+	}
+	println!("Downloading {} ...", url);
+	let response = ureq::get(url).call().map_err(|e| format!("download failed: {e}"))?;
+	let mut archive_bytes = Vec::new();
+	response.into_body().as_reader().read_to_end(&mut archive_bytes)?;
+	let mut archive = Archive::new(GzDecoder::new(Cursor::new(archive_bytes)));
+	for entry in archive.entries()? {
+		let mut entry = entry?;
+		if entry.path()?.file_name().and_then(|n| n.to_str()) == Some("libpdfium.dylib") {
+			let tmp = dest.with_extension("dylib.tmp");
+			entry.unpack(&tmp)?;
+			if dest.exists() {
+				fs::remove_file(dest)?;
+			}
+			fs::rename(&tmp, dest)?;
+			println!("Saved {}", dest.display());
+			return Ok(());
+		}
+	}
+	Err(format!("libpdfium.dylib not found in archive from {url}").into())
+}
+
 fn ios() -> Result<(), Box<dyn Error>> {
 	let release = env::args().any(|a| a == "--release");
 	let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
 	let root = project_root();
 	let generated_dir = root.join("ios/Paperback/Generated");
 	fs::create_dir_all(&generated_dir)?;
+
+	let pdfium_dest = root.join("ios/libpdfium.dylib");
+	download_pdfium_dylib(PDFIUM_IOS_ARM64_URL, &pdfium_dest)?;
 
 	println!("Generating Swift bindings via uniffi-bindgen...");
 	let status = Command::new(&cargo)
@@ -258,11 +306,96 @@ fn project_root() -> PathBuf {
 	Path::new(&env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().to_path_buf()
 }
 
+fn gen_pot() -> Result<(), Box<dyn Error>> {
+	let root = project_root();
+	patois_build::gen_pot(&root, root.join("po"), "paperback")
+}
+
+#[cfg(target_os = "macos")]
+fn build_mac_dmg(target_dir: &Path) -> Result<(), Box<dyn Error>> {
+	let bundle_dir = target_dir.join("Paperback.app");
+	let macos_dir = bundle_dir.join("Contents/MacOS");
+	let resources_dir = bundle_dir.join("Contents/Resources");
+	fs::create_dir_all(&macos_dir)?;
+	fs::create_dir_all(&resources_dir)?;
+
+	// build.rs creates the bundle skeleton but only copies the binary if one already
+	// existed from a prior build.  Copy the freshly-linked binary now.
+	let exe = target_dir.join("paperback");
+	if !exe.exists() {
+		return Err("paperback binary not found after build".into());
+	}
+	fs::copy(&exe, macos_dir.join("paperback"))?;
+	use std::os::unix::fs::PermissionsExt;
+	fs::set_permissions(macos_dir.join("paperback"), fs::Permissions::from_mode(0o755))?;
+
+	// Copy sounds into the bundle's Resources so the app can find them.
+	let sounds_src = target_dir.join("sounds");
+	if sounds_src.exists() {
+		copy_dir_all(&sounds_src, &resources_dir.join("sounds"))?;
+	} else {
+		println!("Warning: sounds directory not found, skipping.");
+	}
+
+	// Copy readme.
+	let readme = target_dir.join("readme.html");
+	if readme.exists() {
+		let _ = fs::copy(&readme, resources_dir.join("readme.html"));
+	}
+
+	println!("Built app: {}", bundle_dir.display());
+
+	// Build a DMG: staging folder contains the .app plus an /Applications symlink
+	// so users get the standard drag-to-install experience.
+	let staging = target_dir.join("dmg-staging");
+	let _ = fs::remove_dir_all(&staging);
+	fs::create_dir_all(&staging)?;
+	copy_dir_all(&bundle_dir, &staging.join("Paperback.app"))?;
+	std::os::unix::fs::symlink("/Applications", staging.join("Applications"))?;
+
+	let dmg_path = target_dir.join("paperback.dmg");
+	let status = Command::new("hdiutil")
+		.args([
+			"create",
+			"-volname",
+			"Paperback",
+			"-srcfolder",
+			&staging.to_string_lossy(),
+			"-ov",
+			"-format",
+			"UDZO",
+			&dmg_path.to_string_lossy(),
+		])
+		.status()?;
+	if !status.success() {
+		return Err("hdiutil create failed".into());
+	}
+	println!("Created DMG: {}", dmg_path.display());
+	Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), Box<dyn Error>> {
+	fs::create_dir_all(dst)?;
+	for entry in WalkDir::new(src) {
+		let entry = entry?;
+		let path = entry.path();
+		let rel = path.strip_prefix(src)?;
+		let dest = dst.join(rel);
+		if path.is_dir() {
+			fs::create_dir_all(&dest)?;
+		} else {
+			fs::copy(path, &dest)?;
+		}
+	}
+	Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
 fn build_zip_package(
 	target_dir: &Path,
 	exe_path: &Path,
 	readme_path: &Path,
-	langs_dir: &Path,
 	sounds_dir: &Path,
 	pdfium_dll_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
@@ -293,21 +426,6 @@ fn build_zip_package(
 	} else {
 		println!("Warning: readme.html not found, skipping.");
 	}
-	if langs_dir.exists() {
-		for entry in WalkDir::new(langs_dir) {
-			let entry = entry?;
-			let path = entry.path();
-			if path.is_file() {
-				let relative_path = path.strip_prefix(target_dir)?;
-				let name = relative_path.to_string_lossy().replace('\\', "/");
-				zip.start_file(name, options)?;
-				let mut f = File::open(path)?;
-				io::copy(&mut f, &mut zip)?;
-			}
-		}
-	} else {
-		println!("Warning: langs directory not found, skipping translations.");
-	}
 	if sounds_dir.exists() {
 		for entry in WalkDir::new(sounds_dir) {
 			let entry = entry?;
@@ -327,6 +445,7 @@ fn build_zip_package(
 	Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn build_windows_installer(target_dir: &Path) -> io::Result<()> {
 	let iss_path = target_dir.join("paperback.iss");
 	if !iss_path.exists() {
